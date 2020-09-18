@@ -1,0 +1,9 @@
+[submodule "deps/zben"]
+	path = deps/zben
+	url = https://github.com/iansimonson/zben.git
+[submodule "deps/http-parser"]
+	path = deps/http-parser
+	url = https://github.com/nodejs/http-parser
+[submodule "deps/zig-uri"]
+	path = deps/zig-uri
+	url = https://github.com/MasterQ32/zig-uri.git
