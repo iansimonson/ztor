@@ -32,6 +32,7 @@ A small-ish but non-trivial program for seeing where zig breaks down / shines.
 - [ ] SSL/TLS support?
 - [ ] Watch a folder for `.torrent` files
 - [ ] Other BEPs?
+- [ ] Make the Torrent Lexer work with Reader/Writer
 
 ### Relevant links
 Prior to this I only knew how torrents worked conceptually. How to implement a torrent downloader was way outside what I knew. The following are relevant links when learning:

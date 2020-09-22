@@ -7,6 +7,8 @@ const c = @cImport({
 });
 
 const util = @import("util.zig");
+const tor = @import("torrent.zig");
+const msg = @import("messages.zig");
 
 // Pretty log function and set level
 // "Magic" root definitions
@@ -28,88 +30,13 @@ const http_parser_sized = extern struct {
     data: *c_void,
 };
 
-const Peer = struct {
-    ip: [4]u8,
-    port: u16,
-};
-
-const PeerConnection = struct {
-    peer: Peer,
-    choked: bool = true,
-    interested: bool = false,
-    connection: std.fs.File,
-
-    pub fn init(peer: Peer, connection: std.fs.File) @This() {
-        return .{
-            .peer = peer,
-            .choked = true,
-            .interested = false,
-            .connection = connection,
-        };
-    }
-
-    pub fn deinit(self: *@This()) void {
-        self.connection.close();
-    }
-};
-
-// TODO - make this so we can download multiple files
-//const ActiveTorrent = struct {
-//    connections: ConnectionList,
-//};
-
-const ConnectionList = std.ArrayList(PeerConnection);
-
-const TRACKER_GET_REQUEST_FORMAT = "GET {}?peer_id={}&" ++ "info_hash={}&" ++
-    "port={}&uploaded={}&downloaded={}&" ++
-    "compact=1&left={} HTTP/1.1\r\nHost: {}\r\n\r\n";
-
-/// Consists of
-/// - Magic: 0x13
-/// - "BitTorrent protocol"
-/// - 8 bytes of 0s
-/// - 20 byte sha1 hash of the info data
-/// - 20 byte peer id reported by the tracker
-const HANDSHAKE_REQUEST_FORMAT = "\x13BitTorrent protocol" ++ ("\x00" ** 8) ++ "{:20}{:20}";
-
-const HEARTBEAT_FORMAT = "";
-
-// Message Type + Optional payload
-const MESSAGE_FORMAT = "{}" ++ "{}";
-
-const MessageType = enum(u8) {
-    choke = 0,
-    unchoke,
-    interested,
-    not_interested,
-    have,
-    bitfield,
-    request,
-    piece,
-    cancel,
-};
-
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const alloc = &gpa.allocator;
 
-const TorrentFile = struct {
-    announce: []const u8,
-    info: Info,
-};
-
-const Info = struct {
-    name: []const u8,
-    piece_length: usize,
-    pieces: []const [20]u8,
-    files: std.ArrayList(FInfo),
-};
-
-const FInfo = struct {
-    name: []const u8,
-    length: usize,
-};
+var peer_id: []const u8 = undefined;
 
 pub fn main() !void {
+    defer _ = gpa.deinit();
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
@@ -118,16 +45,18 @@ pub fn main() !void {
         return error.invalid_arguments;
     }
 
+    // Immediately set up peer-id
+    peer_id = try tor.make_peer_id(alloc);
+    defer alloc.free(peer_id);
+
     const fname = args[1];
     const file = try std.fs.cwd().openFile(fname, .{ .read = true });
     const file_data = try file.readToEndAlloc(alloc, std.math.maxInt(usize));
+    defer alloc.free(file_data);
 
     var hash_buffer = [_]u8{undefined} ** 20;
-    const info = file_data[447 .. file_data.len - 1];
-    std.crypto.hash.Sha1.hash(info[0..], hash_buffer[0..], .{});
-    std.log.info("First char: {s}", .{util.slice_front(info)});
-    std.log.info("Last char: {s}", .{util.slice_back(info)});
-    std.log.info("Hash: {s}", .{hash_buffer});
+    try tor.calculate_info_hash(file_data[0..], hash_buffer[0..]);
+
     std.log.info("Hash as hex: {x}", .{hash_buffer});
 
     var parser = zben.Parser.initWithData(alloc, file_data);
@@ -136,8 +65,10 @@ pub fn main() !void {
     var tree = try parser.parse();
     defer tree.deinit();
 
-    var torrent = try make_torrent(tree);
-    defer torrent.info.files.deinit();
+    var torrent = try tor.make_torrent(alloc, tree);
+    // TODO - this needs to be better
+    torrent.info_hash = hash_buffer[0..];
+    defer torrent.deinit();
 
     std.log.info("Torrent File: {}", .{torrent});
     std.log.info("Made up of {} {}", .{
@@ -149,10 +80,6 @@ pub fn main() !void {
     }
 
     // Open listening torrent port
-    var listener = std.net.StreamServer.init(.{});
-    defer listener.deinit();
-    try listener.listen(std.net.Address.initIp4([_]u8{ 127, 0, 0, 1 }, 6881));
-
     var announce = try uri.parse(torrent.announce);
 
     const host = announce.host.?;
@@ -162,13 +89,12 @@ pub fn main() !void {
     std.log.info("Announce port: {}", .{port});
     std.log.info("URI Path: {}", .{announce.path.?});
 
-    var rnd_buf = [_]u8{undefined} ** 16;
-    try std.crypto.randomBytes(rnd_buf[0..]);
-    const peer_id = try std.fmt.allocPrint(alloc, "ZTOR{s}", .{rnd_buf});
     const escaped_hash = try uri.escapeString(alloc, hash_buffer[0..]);
+    defer alloc.free(escaped_hash);
     const escaped_peer_id = try uri.escapeString(alloc, peer_id);
+    defer alloc.free(escaped_peer_id);
 
-    const formated_request = try std.fmt.allocPrint(alloc, TRACKER_GET_REQUEST_FORMAT, .{
+    const formated_request = try std.fmt.allocPrint(alloc, msg.TRACKER_GET_REQUEST_FORMAT, .{
         announce.path.?,
         escaped_peer_id[0..],
         escaped_hash[0..],
@@ -178,126 +104,97 @@ pub fn main() !void {
         torrent.info.files.items[0].length,
         host,
     });
+    defer alloc.free(formated_request);
 
     std.log.info("Formatted request: {s}", .{formated_request});
 
     std.log.info("Connecting to announce server...", .{});
 
-    if (false) {
-        var connection = try std.net.tcpConnectToHost(alloc, host, port);
-        defer connection.close();
-        try connection.writeAll(formated_request[0..]);
+    var connection = try std.net.tcpConnectToHost(alloc, host, port);
+    defer connection.close();
+    try connection.writeAll(formated_request[0..]);
 
-        var recv_buffer = [_]u8{undefined} ** 4096;
-        const read = try connection.readAll(recv_buffer[0..]);
+    var recv_buffer = [_]u8{undefined} ** 4096;
+    const read = try connection.readAll(recv_buffer[0..]);
 
-        std.log.info("Downloaded {} bytes", .{read});
-        std.log.info("Data received:\n{}", .{recv_buffer[0..read]});
-    }
-    var peer_list = std.ArrayList(Peer).init(alloc);
+    std.log.info("Downloaded {} bytes", .{read});
+    std.log.info("Data received:\n{}", .{recv_buffer[0..read]});
+    var peer_list = std.ArrayList(tor.Peer).init(alloc);
+    defer peer_list.deinit();
 
-    if (false) {
-        var settings: c.http_parser_settings = undefined;
-        settings.on_message_begin = ignore_A;
-        settings.on_message_complete = ignore_A;
-        settings.on_headers_complete = ignore_A;
-        settings.on_status = ignore_B;
-        settings.on_url = ignore_B;
-        settings.on_header_field = ignore_B;
-        settings.on_header_value = ignore_B;
-        settings.on_body = recv_body;
-        settings.on_chunk_header = ignore_A;
-        settings.on_chunk_complete = ignore_A;
-        var http_parser: *c.http_parser = @ptrCast(*c.http_parser, try alloc.create(http_parser_sized));
-        var as_sized = util.cast_from_cptr(*http_parser_sized, http_parser);
-        as_sized.data = @ptrCast(*c_void, &peer_list);
-        defer alloc.destroy(util.cast_from_cptr(*http_parser_sized, http_parser));
-        c.http_parser_init(http_parser, c.enum_http_parser_type.HTTP_RESPONSE);
+    var settings: c.http_parser_settings = undefined;
+    settings.on_message_begin = ignore_A;
+    settings.on_message_complete = ignore_A;
+    settings.on_headers_complete = ignore_A;
+    settings.on_status = ignore_B;
+    settings.on_url = ignore_B;
+    settings.on_header_field = ignore_B;
+    settings.on_header_value = ignore_B;
+    settings.on_body = recv_body;
+    settings.on_chunk_header = ignore_A;
+    settings.on_chunk_complete = ignore_A;
+    var http_parser: *c.http_parser = @ptrCast(*c.http_parser, try alloc.create(http_parser_sized));
+    var as_sized = util.cast_from_cptr(*http_parser_sized, http_parser);
+    as_sized.data = @ptrCast(*c_void, &peer_list);
+    defer alloc.destroy(util.cast_from_cptr(*http_parser_sized, http_parser));
+    c.http_parser_init(http_parser, c.enum_http_parser_type.HTTP_RESPONSE);
 
-        // not sure what to do with nparsed
-        const nparsed = c.http_parser_execute(http_parser, &settings, recv_buffer[0..read].ptr, read);
-        std.log.info("DONE DONE DONE", .{});
-    }
+    // not sure what to do with nparsed
+    const nparsed = c.http_parser_execute(http_parser, &settings, recv_buffer[0..read].ptr, read);
+    std.log.info("DONE DONE DONE", .{});
 
-    try peer_list.append(Peer{
-        .ip = [4]u8{ 127, 0, 0, 1 },
-        .port = 9000,
-    });
+    // Set up the libuv loop
+    const loop = c.uv_default_loop();
+    loop.?.*.data = @ptrCast(?*c_void, alloc);
 
-    for (peer_list.items) |peer| {
-        std.log.info("Found: Peer{{ .ip = {d}.{d}.{d}.{d}, .port = {}}}", .{ peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.port });
-    }
-
-    // Connect to each peer
-    // Send handshakes
-    // Recv handshakes - close connections which fail this
-    var connections = ConnectionList.init(alloc);
+    // Default is max 50 peers so lets go with 100 for now
+    var connections = try std.ArrayList(PeerConnection).initCapacity(alloc, 100);
     defer connections.deinit();
 
-    var poll_fds_list = std.ArrayList(std.os.pollfd).init(alloc);
-    defer poll_fds_list.deinit();
+    try peer_list.resize(0);
+    peer_list.appendAssumeCapacity(tor.Peer{ .ip = [_]u8{ 141, 239, 102, 196 }, .port = 6881 });
+    for (peer_list.items) |peer| {
+        std.log.info("Found: Peer{{ .ip = {d}.{d}.{d}.{d}, .port = {}}}", .{
+            peer.ip[0],
+            peer.ip[1],
+            peer.ip[2],
+            peer.ip[3],
+            peer.port,
+        });
 
-    for (peer_list.items) |peer, i| {
-        const addr = std.net.Address.initIp4(peer.ip, peer.port);
-        var f = tcpConnectToAddress(addr) catch |e| {
-            std.log.warn("Could not connect to peer {}.{}.{}.{}:{} - {}", .{
-                peer.ip[0], peer.ip[1], peer.ip[2], peer.ip[3], peer.port, e,
-            });
-            continue;
-        };
-        errdefer f.close();
-        connections.append(PeerConnection.init(peer, f)) catch |e| {
-            std.log.err("Error adding peer connection to list: {}", .{e});
-            return e;
-        };
-        poll_fds_list.append(std.os.pollfd{
-            .fd = f.handle,
-            .events = std.os.POLLOUT | std.os.POLLIN,
-            .revents = 0,
-        }) catch |e| {
-            std.log.err("Error adding peer connection to write list: {}", .{e});
-            return e;
-        };
+        connections.appendAssumeCapacity(PeerConnection{
+            .peer = peer,
+            .connection = undefined,
+            .torrent = &torrent,
+        });
+        var peer_con = &util.slice_back(connections.items)[0];
+        _ = c.uv_tcp_init(loop, &peer_con.connection);
+        peer_con.connection.data = @ptrCast(?*c_void, peer_con);
+        std.log.info("peer_con ptr: {*}", .{peer_con});
 
-        std.log.info("Writing to peer..", .{});
-        const buf = try std.fmt.allocPrint(alloc, HANDSHAKE_REQUEST_FORMAT, .{ hash_buffer[0..], peer_id[0..] });
-        defer alloc.free(buf);
-        var to_write = buf[0..];
-        while (true) {
-            if (to_write.len == 0) {
-                break;
-            }
-            const ready = std.os.poll(poll_fds_list.items, 0) catch {
-                std.log.info("Socket not ready...", .{});
-                continue;
-            };
-            if (ready == 0) {
-                continue;
-            }
-            const len: usize = std.os.write(f.handle, to_write) catch |e| blk: {
-                switch (e) {
-                    error.WouldBlock => break :blk 0,
-                    else => return e,
-                }
-            };
+        var addr: c.sockaddr_in = undefined;
+        const addr_name = try std.fmt.allocPrint0(alloc, "{}.{}.{}.{}", .{
+            peer.ip[0],
+            peer.ip[1],
+            peer.ip[2],
+            peer.ip[3],
+        });
+        defer alloc.free(addr_name);
+        _ = c.uv_ip4_addr(addr_name.ptr, peer.port, &addr);
 
-            to_write.ptr += len;
-            to_write.len -= len;
-        }
-        std.log.info("Wrote to peer..", .{});
-        //f.writer().print() catch |e| {
-        //    std.log.err("Error writing handshake to peer - {}", .{e});
-        //    f.close();
-        //    _ = connections.pop();
-        //};
-        //const r = try f.reader().read();
+        std.log.info("Connecting to: {}", .{addr_name});
+        const connect = try alloc.create(c.uv_connect_t);
+        connect.data = @ptrCast(?*c_void, peer_con);
+        _ = c.uv_tcp_connect(connect, &peer_con.connection, @ptrCast(?*const c.sockaddr, &addr), on_connect_peer);
     }
+
+    _ = c.uv_run(loop, util.castCEnum(c.uv_run, 1, c.UV_RUN_DEFAULT));
 }
 
 export fn recv_body(p: ?*c.http_parser, data: [*c]const u8, len: usize) callconv(.C) c_int {
     if (p == null) return 1;
     var as_sized = @ptrCast(*http_parser_sized, @alignCast(@alignOf(*http_parser_sized), p.?));
-    var peer_list = @ptrCast(*std.ArrayList(Peer), @alignCast(@alignOf(*std.ArrayList(Peer)), as_sized.data));
+    var peer_list = @ptrCast(*std.ArrayList(tor.Peer), @alignCast(@alignOf(*std.ArrayList(tor.Peer)), as_sized.data));
     var parser = zben.Parser.initWithData(alloc, data[0..len]);
     defer parser.deinit();
 
@@ -313,7 +210,7 @@ export fn recv_body(p: ?*c.http_parser, data: [*c]const u8, len: usize) callconv
     var i: usize = 0;
     while (i < num_peers) : (i += 1) {
         const offset = i * peer_size;
-        var peer: Peer = undefined;
+        var peer: tor.Peer = undefined;
         var u16_buf = [2]u8{ undefined, undefined };
         std.mem.copy(u8, peer.ip[0..], data[offset .. offset + 4]);
         std.mem.copy(u8, u16_buf[0..], data[offset + 4 .. offset + 6]);
@@ -331,56 +228,6 @@ export fn ignore_A(p: ?*c.http_parser) callconv(.C) c_int {
 
 export fn ignore_B(parser: ?*c.http_parser, data: [*c]const u8, len: usize) callconv(.C) c_int {
     return 0;
-}
-
-fn make_torrent(tree: zben.BencodeTree) !TorrentFile {
-    const top_level = &tree.root.Dictionary;
-    var torrent: TorrentFile = undefined;
-    torrent.announce = (top_level.get("announce") orelse return error.invalid_dictionary).String;
-    const info = (top_level.get("info") orelse return error.invalid_dictionary).Dictionary;
-    torrent.info.name = (info.get("name") orelse return error.invalid_dictionary).String;
-    torrent.info.piece_length = @intCast(usize, (info.get("piece length") orelse return error.invalid_dictionary).Integer);
-    const str = (info.get("pieces") orelse return error.invalid_dictionary).String;
-    torrent.info.pieces.ptr = @ptrCast([*]const [20]u8, str.ptr);
-    torrent.info.pieces.len = str.len / 20;
-
-    torrent.info.files = std.ArrayList(FInfo).init(alloc);
-    errdefer torrent.info.files.deinit();
-    if (info.get("length")) |len| {
-        try torrent.info.files.append(.{ .name = torrent.info.name, .length = @intCast(usize, len.Integer) });
-    } else if (info.get("files")) |files| {
-        for (files.List.items) |file| {
-            const name = (file.Dictionary.get("path") orelse return error.invalid_dictionary).String;
-            const len = @intCast(usize, (file.Dictionary.get("length") orelse return error.invalid_dictionary).Integer);
-            try torrent.info.files.append(.{ .name = name, .length = @intCast(usize, len) });
-        }
-    } else {
-        return error.invalid_dictionary;
-    }
-
-    return torrent;
-}
-
-fn printValue(v: zben.Value) void {
-    switch (v) {
-        .Empty => std.log.warn("Got an empty value somehow", .{}),
-        .Integer => |i| std.log.info("Integer: {}", .{i}),
-        .String => |s| std.log.info("String: {}", .{s}),
-        .List => |l| {
-            std.log.info("LIST:", .{});
-            for (l.items) |item| {
-                printValue(item);
-            }
-        },
-        .Dictionary => |d| {
-            std.log.info("DICT:", .{});
-            var iter = d.iterator();
-            while (iter.next()) |entry| {
-                std.log.info("KEY: {}", .{entry.key});
-                printValue(entry.value);
-            }
-        },
-    }
 }
 
 /// Override of std.net.tcpConnectToAddress so we can do non-blocking io ourselves
@@ -401,3 +248,143 @@ fn tcpConnectToAddress(address: std.net.Address) !std.fs.File {
 
     return std.fs.File{ .handle = sockfd };
 }
+
+/// Metadata about a particular peer
+/// we are connected to for a particular torrent
+/// Note: Torrent is NON-OWNING as each
+/// peer has a reference to the same torrent
+const PeerConnection = struct {
+    peer: tor.Peer,
+    choked: bool = true,
+    interested: bool = false,
+    hand_shook: bool = false,
+    connection: c.uv_tcp_t,
+    torrent: *tor.TorrentFile,
+};
+
+/// Start handshaking with peer on successful connection
+export fn on_connect_peer(con: ?*c.uv_connect_t, status: i32) void {
+    const peer_con = util.cast_from_cptr(*PeerConnection, con.?.handle.?.*.data);
+    std.log.info("peer_con ptr: {}", .{con.?.handle.?.*.data});
+    if (status < 0) {
+        std.log.err("Error connecting to peer: {}.{}.{}.{}:{} - {s}", .{
+            peer_con.peer.ip[0],
+            peer_con.peer.ip[1],
+            peer_con.peer.ip[2],
+            peer_con.peer.ip[3],
+            peer_con.peer.port,
+            c.uv_strerror(status),
+        });
+        alloc.destroy(con.?);
+        return;
+    }
+    std.log.info("Successfully connected to peer: {}.{}.{}.{}:{}", .{
+        peer_con.peer.ip[0],
+        peer_con.peer.ip[1],
+        peer_con.peer.ip[2],
+        peer_con.peer.ip[3],
+        peer_con.peer.port,
+    });
+    var req = alloc.create(WriteReq) catch unreachable;
+    var to_send = msg.make_handshake(alloc, peer_id, peer_con.torrent.info_hash) catch unreachable;
+    req.buf = c.uv_buf_init(to_send.ptr, @intCast(u32, to_send.len));
+    std.log.info("Sent peer - {s}", .{to_send});
+    _ = c.uv_write(&req.req, con.?.handle, &req.buf, 1, on_write);
+    _ = c.uv_read_start(con.?.handle, alloc_buffer, on_read_handshake);
+    alloc.destroy(con.?);
+}
+
+/// Allocates a buffer for libuv to use
+export fn alloc_buffer(handle: ?*c.uv_handle_t, suggested_size: usize, buf: ?*c.uv_buf_t) void {
+    std.debug.assert(buf != null);
+    std.debug.assert(handle != null);
+
+    if (buf) |b| {
+        var data = alloc.alloc(u8, suggested_size) catch {
+            std.log.err("Error allocating buffer on callback", .{});
+            b.* = c.uv_buf_init(null, 0);
+            return;
+        };
+
+        b.* = c.uv_buf_init(data.ptr, @intCast(u32, suggested_size));
+    }
+}
+
+/// Function to free buffers allocated by alloc_buffer
+/// This is a callback after successfully sending bytes down
+/// the wire
+/// TODO: errors?
+export fn on_write(req: ?*c.uv_write_t, status: i32) void {
+    const write_req = @fieldParentPtr(WriteReq, "req", req.?);
+    alloc.free(write_req.buf.base[0..write_req.buf.len]);
+    alloc.destroy(write_req);
+}
+
+export fn on_read_handshake(client: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) void {
+    const peer_con = util.cast_from_cptr(*PeerConnection, client.?.data);
+    std.log.info("Got response from peer: {}.{}.{}.{}:{}", .{
+        peer_con.peer.ip[0],
+        peer_con.peer.ip[1],
+        peer_con.peer.ip[2],
+        peer_con.peer.ip[3],
+        peer_con.peer.port,
+    });
+
+    if (nread < 0) {
+        if (nread == c.UV_EOF) {
+            std.log.warn("Peer disconnected. Closing handle...", .{});
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), null);
+        }
+    } else if (nread > 0) {
+        if (nread < 68) {
+            std.log.err("Error, handshake not large enough - {} bytes", .{nread});
+        }
+        std.log.info("Handshake: {}", .{buf.?.base[0..68]});
+        std.log.info("Rest in hex: {x}", .{buf.?.base[68..@intCast(usize, nread)]});
+    }
+
+    // TODO: actually check the handshake
+    // But for now assume we're good to go
+    _ = c.uv_read_start(client, alloc_buffer, on_read);
+    if (buf.?.base != null) {
+        alloc.free(buf.?.base[0..buf.?.len]);
+    }
+}
+
+/// Read data, client should have already gone through handshake callback
+/// This handles the dispatching of messages
+export fn on_read(client: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) void {
+    std.debug.assert(client != null);
+    std.debug.assert(buf != null);
+
+    if (nread < 0) {
+        if (nread == c.UV_EOF) {
+            std.log.warn("Peer disconnected. Closing handle...", .{});
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), null);
+        }
+    } else if (nread > 0) {
+        const peer_con = util.cast_from_cptr(*PeerConnection, client.?.data);
+        std.log.info("Got message from peer: {}.{}.{}.{}:{}", .{
+            peer_con.peer.ip[0],
+            peer_con.peer.ip[1],
+            peer_con.peer.ip[2],
+            peer_con.peer.ip[3],
+            peer_con.peer.port,
+        });
+        std.log.info("Received {} bytes - {}", .{ nread, buf.?.base[0..@intCast(usize, nread)] });
+    }
+    //} else if (nread > 0) {
+    //    const peer_con = util.cast_from_cptr(*PeerConnection, client.?.data);
+    //    _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), null);
+    //}
+
+    _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), null);
+    if (buf.?.base != null) {
+        alloc.free(buf.?.base[0..buf.?.len]);
+    }
+}
+
+const WriteReq = struct {
+    req: c.uv_write_t,
+    buf: c.uv_buf_t,
+};

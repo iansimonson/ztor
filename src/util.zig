@@ -13,13 +13,19 @@ pub fn log(
     //    else => return,
     //} ++ "): ";
     const scope_prefix = "(" ++ @tagName(scope) ++ "): ";
+    const end_color = "\x1b[0m";
+    const color = switch (level) {
+        .warn => "\x1b[93m",
+        .err => "\x1b[91m",
+        else => end_color,
+    };
 
     const prefix = "[" ++ @tagName(level) ++ "] " ++ scope_prefix;
 
     const held = std.debug.getStderrMutex().acquire();
     defer held.release();
     const stderr = std.io.getStdErr().writer();
-    nosuspend stderr.print(prefix ++ format ++ "\n", args) catch return;
+    nosuspend stderr.print(color ++ prefix ++ format ++ "\n" ++ end_color, args) catch return;
 }
 
 /// Given a function and an index returns the type
@@ -47,11 +53,11 @@ pub fn cast_from_cptr(comptime T: type, ptr: anytype) T {
 }
 
 /// Returns the last item in a slice as a slice of length 1
-pub fn slice_back(data: []const u8) []const u8 {
+pub fn slice_back(data: anytype) @TypeOf(data) {
     return data[data.len - 1 .. data.len];
 }
 
 /// Returns the first item in a slice as a slice of length 1
-pub fn slice_front(data: []const u8) []const u8 {
+pub fn slice_front(data: anytype) @TypeOf(data) {
     return data[0..1];
 }

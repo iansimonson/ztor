@@ -70,6 +70,7 @@ pub fn build(b: *Builder) !void {
     exe.addLibPath("./zig-cache/lib/");
     exe.addIncludeDir("./zig-cache/include");
     exe.linkSystemLibraryName("http_parser");
+    exe.linkSystemLibrary("uv");
     exe.linkLibC();
     exe.install();
     exe.step.dependOn(&http_parser.step);
