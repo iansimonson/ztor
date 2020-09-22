@@ -14,8 +14,14 @@ Zig BitTorrent Client
 - [ ] Setup server for incoming connections
     - [ ] Upload throttled amount of data
 - [ ] Throttle data speeds
+    - [ ] [Token Bucket](https://en.wikipedia.org/wiki/Token_bucket)?
+        - Basically a rolling window
+    - [ ] Upload throttle
+    - [ ] Download throttle
 - [ ] Setup imgui for handling torrents in GUI mode
 
 ### Additional TODO:
 - [ ] Support non-compact peer list
 - [ ] Confirm peer_ids
+- [ ] Support uTP protocol rather than using TCP
+- [ ] SSL/TLS support?
