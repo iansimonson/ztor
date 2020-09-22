@@ -1,4 +1,7 @@
 const std = @import("std");
+
+/// This is taken from std.log's example of what
+/// a logging function might look like
 pub fn log(
     comptime level: std.log.Level,
     comptime scope: @TypeOf(.EnumLiteral),
