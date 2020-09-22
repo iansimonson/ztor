@@ -33,11 +33,3 @@ pub fn castCEnum(comptime c_func: anytype, comptime arg_pos: usize, enum_value: 
 pub fn cast_from_cptr(comptime T: type, ptr: anytype) T {
     return @ptrCast(T, @alignCast(@alignOf(T), ptr));
 }
-
-pub fn slice_back(data: []const u8) []const u8 {
-    return data[data.len - 1 .. data.len];
-}
-
-pub fn slice_front(data: []const u8) []const u8 {
-    return data[0..1];
-}
