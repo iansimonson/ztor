@@ -28,7 +28,7 @@ A small-ish but non-trivial program for seeing where zig breaks down / shines.
 - [ ] Support non-compact peer list
 - [ ] Confirm peer_ids
 - [ ] Support uTP protocol rather than using TCP
-- [ ] Support UDP tracker protocol
+- [ ] Support UDP tracker protocol (BEP 015)
 - [ ] SSL/TLS support?
 - [ ] Watch a folder for `.torrent` files
 - [ ] Other BEPs?
