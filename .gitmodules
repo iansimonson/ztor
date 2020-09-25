@@ -7,3 +7,6 @@
 [submodule "deps/zig-uri"]
 	path = deps/zig-uri
 	url = https://github.com/MasterQ32/zig-uri.git
+[submodule "deps/libuv"]
+	path = deps/libuv
+	url = https://github.com/libuv/libuv.git

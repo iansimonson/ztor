@@ -1,5 +1,7 @@
 const std = @import("std");
 
+var log_file: ?std.fs.File = null;
+
 /// This is taken from std.log's example of what
 /// a logging function might look like
 pub fn log(
@@ -8,6 +10,9 @@ pub fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    if (log_file == null) {
+        log_file = std.fs.cwd().createFile("ztor.log", .{}) catch unreachable;
+    }
     //const scope_prefix = "(" ++ switch (scope) {
     //    .default => @tagName(scope),
     //    else => return,
@@ -22,10 +27,7 @@ pub fn log(
 
     const prefix = "[" ++ @tagName(level) ++ "] " ++ scope_prefix;
 
-    const held = std.debug.getStderrMutex().acquire();
-    defer held.release();
-    const stderr = std.io.getStdErr().writer();
-    nosuspend stderr.print(color ++ prefix ++ format ++ "\n" ++ end_color, args) catch return;
+    log_file.?.writer().print(color ++ prefix ++ format ++ "\n" ++ end_color, args) catch return;
 }
 
 /// Given a function and an index returns the type

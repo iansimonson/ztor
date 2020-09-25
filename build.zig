@@ -49,6 +49,49 @@ fn build_http_parser(b: *Builder) *std.build.RunStep {
     return install_http_parser_headers;
 }
 
+//fn build_libuv(b: *Builder) *std.build.RunStep {
+//    const ensure_lib_dir_exists = b.addSystemCommand(
+//        &[_][]const u8{
+//            "mkdir",
+//            "-p",
+//            "./zig-cache/lib",
+//        },
+//    );
+//    const ensure_include_dir_exists = b.addSystemCommand(
+//        &[_][]const u8{
+//            "mkdir",
+//            "-p",
+//            "./zig-cache/include/libuv",
+//        },
+//    );
+//    const build_http_parser_c = b.addSystemCommand(
+//        &[_][]const u8{
+//            "make",
+//            "-C",
+//            "./deps/libuv/",
+//        },
+//    );
+//    build_http_parser_c.step.dependOn(&ensure_include_dir_exists.step);
+//    build_http_parser_c.step.dependOn(&ensure_lib_dir_exists.step);
+//    const install_http_parser_lib = b.addSystemCommand(
+//        &[_][]const u8{
+//            "cp",
+//            "./deps/http-parser/libhttp_parser.a",
+//            "./zig-cache/lib/libhttp_parser.a",
+//        },
+//    );
+//    install_http_parser_lib.step.dependOn(&build_http_parser_c.step);
+//    const install_http_parser_headers = b.addSystemCommand(
+//        &[_][]const u8{
+//            "cp",
+//            "./deps/http-parser/http_parser.h",
+//            "./zig-cache/include/http-parser/http_parser.h",
+//        },
+//    );
+//    install_http_parser_headers.step.dependOn(&install_http_parser_lib.step);
+//    return install_http_parser_headers;
+//}
+
 pub fn build(b: *Builder) !void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
@@ -78,6 +121,8 @@ pub fn build(b: *Builder) !void {
     const uvtee = b.addExecutable("uvtee", "src/uv_examples/uvtee.zig");
     uvtee.setTarget(target);
     uvtee.setBuildMode(mode);
+    uvtee.addIncludeDir("./zig-cache/include");
+    uvtee.addLibPath("./zig-cache/lib/");
     uvtee.linkSystemLibrary("uv");
     uvtee.linkLibC();
     uvtee.install();
@@ -86,6 +131,8 @@ pub fn build(b: *Builder) !void {
     uvserver.setTarget(target);
     uvserver.setBuildMode(mode);
     uvserver.linkSystemLibrary("uv");
+    uvserver.addIncludeDir("./zig-cache/include");
+    uvserver.addLibPath("./zig-cache/lib/");
     uvserver.linkLibC();
     uvserver.install();
 
@@ -93,6 +140,8 @@ pub fn build(b: *Builder) !void {
     uvclient.setTarget(target);
     uvclient.setBuildMode(mode);
     uvclient.linkSystemLibrary("uv");
+    uvclient.addIncludeDir("./zig-cache/include");
+    uvclient.addLibPath("./zig-cache/lib/");
     uvclient.linkLibC();
     uvclient.install();
 

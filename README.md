@@ -6,18 +6,18 @@ Zig BitTorrent Client
 A small-ish but non-trivial program for seeing where zig breaks down / shines.
 
 ### Plan
-- [ ] Connect to tracker and download peer info
-    - [ ] Parse .torrent into tree
-    - [ ] Find announce url
-    - [ ] Connect and download peer list
+- [x] Connect to tracker and download peer info
+    - [x] Parse .torrent into tree
+    - [x] Find announce url
+    - [x] Connect and download peer list
 - [ ] Establish connections to peers
-    - [ ] Construct peer connection info per peer
+    - [x] Construct peer connection info per peer
     - [ ] Only download on unchoke
+- [ ] Use `uv_get_handle` rather than the members
 - [ ] Setup server for incoming connections
     - [ ] Upload throttled amount of data
 - [ ] Throttle data speeds
-    - [ ] [Token Bucket](https://en.wikipedia.org/wiki/Token_bucket)?
-        - Basically a rolling window
+    - [ ] [Token Bucket](https://en.wikipedia.org/wiki/Token\_bucket)?
     - [ ] Upload throttle
     - [ ] Download throttle
 - [ ] Setup imgui for handling torrents in GUI mode
@@ -25,6 +25,7 @@ A small-ish but non-trivial program for seeing where zig breaks down / shines.
 
 ### Additional TODO:
 - [ ] Move from libuv to native zig async/await
+    - [ ] Abstract away libuv
 - [ ] Support non-compact peer list
 - [ ] Confirm peer_ids
 - [ ] Support uTP protocol rather than using TCP
