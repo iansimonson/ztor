@@ -92,6 +92,12 @@ export fn http_tracker_parse_body(p: ?*c.http_parser, data: [*c]const u8, len: u
     return 0;
 }
 
+const CompletePiece = struct {
+    index: usize,
+    buffer: []u8,
+    read_length: usize,
+};
+
 /// Manages an torrent, both uploading and downloading
 /// as well as writing out to file. Contains all the context
 /// necessary for a given torrent.
@@ -106,7 +112,10 @@ pub const TorrentContext = struct {
     connected_peers: ConnectionList,
     // Peers which we are not connected to
     inactive_peers: ConnectionList,
-    output_file: c.uv_fs_t,
+    completed_pieces: std.ArrayList(CompletePiece),
+    to_write_piece: usize = 0,
+    output_file_pipe: c.uv_pipe_t,
+    output_filed: c.uv_file,
     work_queue: WorkQueue,
 
     tracker_connection: c.uv_tcp_t,
@@ -121,7 +130,9 @@ pub const TorrentContext = struct {
             .torrent = undefined,
             .connected_peers = ConnectionList.init(alloc),
             .inactive_peers = ConnectionList.init(alloc),
-            .output_file = undefined,
+            .completed_pieces = std.ArrayList(CompletePiece).init(alloc),
+            .output_file_pipe = undefined,
+            .output_filed = undefined,
             .work_queue = WorkQueue.init(alloc),
             .tracker_connection = undefined,
             .timer = undefined,
@@ -137,7 +148,9 @@ pub const TorrentContext = struct {
             .torrent = torrent,
             .connected_peers = ConnectionList.init(allocator),
             .inactive_peers = ConnectionList.init(allocator),
-            .output_file = undefined,
+            .completed_pieces = std.ArrayList(CompletePiece).init(allocator),
+            .output_file_pipe = undefined,
+            .output_filed = undefined,
             .work_queue = WorkQueue.init(allocator),
             .tracker_connection = undefined,
             .timer = undefined,
@@ -268,6 +281,7 @@ pub const TorrentContext = struct {
         }
         self.connected_peers.deinit();
         self.inactive_peers.deinit();
+        self.completed_pieces.deinit();
         self.tracker_read_stream.deinit();
         self.work_queue.deinit();
     }
@@ -320,6 +334,13 @@ pub const TorrentContext = struct {
         self.timer.data = self;
         _ = c.uv_timer_start(&self.timer, on_torrent_timer, 100, 100);
 
+        const name = self.allocator.dupeZ(u8, self.torrent.info.files.items[0].name) catch unreachable;
+        defer self.allocator.free(name);
+        var req: c.uv_fs_t = undefined;
+        self.output_filed = c.uv_fs_open(self.loop, &req, name.ptr, c.O_CREAT | c.O_RDWR, 0o644, null);
+        _ = c.uv_pipe_init(self.loop, &self.output_file_pipe, 0);
+        _ = c.uv_pipe_open(&self.output_file_pipe, self.output_filed);
+
         for (self.inactive_peers.items) |peer| {
             _ = c.uv_tcp_init(self.loop, &peer.connection);
             _ = c.uv_tcp_nodelay(&peer.connection, 1);
@@ -360,7 +381,11 @@ pub const TorrentContext = struct {
         for (self.connected_peers.items) |peer| {
             peer.close();
         }
-        _ = c.uv_timer_stop(&self.timer);
+
+        if (self.to_write_piece > self.torrent.info.pieces.len) {
+            _ = c.uv_timer_stop(&self.timer);
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.output_file_pipe), null);
+        }
     }
 
     pub fn dispatchWork(self: *@This()) void {
@@ -368,10 +393,48 @@ pub const TorrentContext = struct {
             item.nextPiece();
         }
     }
+
+    fn sort_by_index(ctx: *const @This(), lhs: CompletePiece, rhs: CompletePiece) bool {
+        return lhs.index < rhs.index;
+    }
+
+    pub fn writePieces(self: *@This()) void {
+        std.sort.sort(CompletePiece, self.completed_pieces.items, self, sort_by_index);
+
+        while (self.completed_pieces.items.len > 0 and self.completed_pieces.items[0].index == self.to_write_piece) {
+            const item = &self.completed_pieces.items[0];
+            const req = self.allocator.create(WriteReq) catch unreachable;
+            req.buf = c.uv_buf_init(
+                (self.allocator.alloc(u8, item.read_length) catch unreachable).ptr,
+                @intCast(u32, item.read_length),
+            );
+            std.mem.copy(u8, req.buf.base[0..req.buf.len], item.buffer[0..item.read_length]);
+            req.req.data = self;
+            _ = c.uv_write(
+                &req.req,
+                @ptrCast(?*c.uv_stream_t, &self.output_file_pipe),
+                &req.buf,
+                1,
+                on_file_write,
+            );
+            self.allocator.free(item.buffer);
+            _ = self.completed_pieces.orderedRemove(0);
+            log.info("Wrote piece {}/{}", .{ self.to_write_piece, self.torrent.info.pieces.len });
+            self.to_write_piece += 1;
+        }
+    }
 };
+
+export fn on_file_write(req: ?*c.uv_write_t, status: i32) void {
+    const write_req = @fieldParentPtr(WriteReq, "req", req.?);
+    const tc = getTorrentContext(req);
+    tc.allocator.free(write_req.buf.base[0..write_req.buf.len]);
+    tc.allocator.destroy(write_req);
+}
 
 export fn on_torrent_timer(timer: ?*c.uv_timer_t) void {
     const torrent = getTorrentContext(timer);
+    torrent.writePieces();
     torrent.dispatchWork();
     torrent.checkFinished();
 }
@@ -631,13 +694,12 @@ const PeerConnection = struct {
 
                         cw.awaiting -= 1;
                         cw.current_offset += rest.len;
-                        self.nextPiece();
 
-                        if (cw.awaiting == 0 and cw.current_offset >= self.torrent.torrent.info.piece_length) {
+                        if (piece_complete(cw.*, self.torrent.torrent.info.piece_length)) {
                             log.info("Peer {} fully downloaded piece {}", .{ self.peer, cw.idx });
-                            self.current_work = null;
-                            self.nextPiece();
+                            self.send_finished_piece();
                         }
+                        self.nextPiece();
                     } else {
                         log.warn(
                             "Got a piece message with no current work for {{idx = {}, offset = {}}}",
@@ -650,6 +712,21 @@ const PeerConnection = struct {
     }
 
     const max_pipelined_pieces: u8 = 5;
+
+    fn piece_complete(work: WorkData, length: usize) bool {
+        return work.awaiting == 0 and work.current_offset >= length;
+    }
+
+    fn send_finished_piece(self: *@This()) void {
+        self.piece_buffer.realign();
+        self.torrent.completed_pieces.append(.{
+            .index = self.current_work.?.idx,
+            .buffer = self.piece_buffer.buf,
+            .read_length = self.piece_buffer.readableLength(),
+        }) catch unreachable;
+        self.current_work = null;
+        self.piece_buffer = Buffer.init(self.torrent.allocator);
+    }
 
     fn nextPiece(self: *@This()) void {
         if (self.choked) {
