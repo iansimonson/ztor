@@ -3,16 +3,19 @@ ZTOR
 Zig BitTorrent Client
 ---
 
+**NOT CURRENTLY FUNCTIONAL. Work in progress**
+
 A small-ish but non-trivial program for seeing where zig breaks down / shines.
+
 
 ### Plan
 - [x] Connect to tracker and download peer info
     - [x] Parse .torrent into tree
     - [x] Find announce url
     - [x] Connect and download peer list
-- [ ] Establish connections to peers
+- [x] Establish connections to peers
     - [x] Construct peer connection info per peer
-    - [ ] Only download on unchoke
+    - [x] Only download on unchoke
 - [ ] Use `uv_get_handle` rather than the members
 - [ ] Setup server for incoming connections
     - [ ] Upload throttled amount of data
@@ -27,7 +30,7 @@ A small-ish but non-trivial program for seeing where zig breaks down / shines.
 - [ ] Move from libuv to native zig async/await
     - [ ] Abstract away libuv
 - [ ] Support non-compact peer list
-- [ ] Confirm peer_ids
+- [ ] Confirm peer\_ids
 - [ ] Support uTP protocol rather than using TCP
 - [ ] Support UDP tracker protocol (BEP 015)
 - [ ] SSL/TLS support?
