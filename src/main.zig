@@ -9,7 +9,7 @@ const msg = @import("messages.zig");
 // Pretty log function and set level
 // "Magic" root definitions
 pub const log = util.log;
-pub const log_level = std.log.Level.info;
+pub const log_level = std.log.Level.debug;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 const alloc = &gpa.allocator;

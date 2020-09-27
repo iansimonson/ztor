@@ -121,6 +121,7 @@ pub const TorrentContext = struct {
     tracker_connection: c.uv_tcp_t,
     timer: c.uv_timer_t,
     tracker_read_stream: std.fifo.LinearFifo(u8, .Dynamic),
+    inflight_file_pieces: usize = 0,
 
     pub fn init(alloc: *Allocator, peer_id: []const u8) @This() {
         return .{
@@ -220,11 +221,15 @@ pub const TorrentContext = struct {
             announce.host.?,
         }) catch unreachable;
 
-        var req = self.allocator.create(msg.WriteReq) catch unreachable;
-        req.buf.base = formated_request.ptr;
-        req.buf.len = @intCast(u32, formated_request.len);
-        _ = c.uv_write(&req.req, @ptrCast(?*c.uv_stream_t, &self.tracker_connection), &req.buf, 1, onWriteAnnounceFwd);
-        _ = c.uv_read_start(@ptrCast(?*c.uv_stream_t, &self.tracker_connection), tcAllocBuffer, onReadAnnounceFwd);
+        msg.write(self.allocator, formated_request, &self.tracker_connection, onWriteAnnounceFwd) catch |e| {
+            log.warn("Error connecting to tracker. Shutting down", .{});
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.tracker_connection), null);
+            return;
+        };
+        msg.read_start(&self.tracker_connection, tcAllocBuffer, onReadAnnounceFwd) catch |e| {
+            log.warn("Error reading from stream", .{});
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.tracker_connection), null);
+        };
     }
 
     pub fn onReadAnnounce(self: *@This(), handle: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) void {
@@ -339,6 +344,7 @@ pub const TorrentContext = struct {
         var req: c.uv_fs_t = undefined;
         self.output_filed = c.uv_fs_open(self.loop, &req, name.ptr, c.O_CREAT | c.O_RDWR, 0o644, null);
         _ = c.uv_pipe_init(self.loop, &self.output_file_pipe, 0);
+        self.output_file_pipe.data = self;
         _ = c.uv_pipe_open(&self.output_file_pipe, self.output_filed);
 
         for (self.inactive_peers.items) |peer| {
@@ -367,7 +373,8 @@ pub const TorrentContext = struct {
     }
 
     pub fn checkFinished(self: *@This()) void {
-        const work_done = self.work_queue.readableLength() == 0;
+        const work_done = self.work_queue.readableLength() == 0 and self.completed_pieces.items.len == 0 and self.inflight_file_pieces == 0;
+
         if (!work_done) {
             return;
         }
@@ -403,33 +410,29 @@ pub const TorrentContext = struct {
 
         while (self.completed_pieces.items.len > 0 and self.completed_pieces.items[0].index == self.to_write_piece) {
             const item = &self.completed_pieces.items[0];
-            const req = self.allocator.create(WriteReq) catch unreachable;
-            req.buf = c.uv_buf_init(
-                (self.allocator.alloc(u8, item.read_length) catch unreachable).ptr,
-                @intCast(u32, item.read_length),
-            );
-            std.mem.copy(u8, req.buf.base[0..req.buf.len], item.buffer[0..item.read_length]);
-            req.req.data = self;
-            _ = c.uv_write(
-                &req.req,
-                @ptrCast(?*c.uv_stream_t, &self.output_file_pipe),
-                &req.buf,
-                1,
-                on_file_write,
-            );
+            const data = self.allocator.alloc(u8, item.read_length) catch unreachable;
+            std.mem.copy(u8, data[0..], item.buffer[0..item.read_length]);
+            msg.write(self.allocator, data, &self.output_file_pipe, on_file_write) catch |e| {
+                log.warn("Error writing piece to file - {}", .{e});
+                self.allocator.free(data);
+                return;
+            };
+
             self.allocator.free(item.buffer);
             _ = self.completed_pieces.orderedRemove(0);
-            log.info("Wrote piece {}/{}", .{ self.to_write_piece, self.torrent.info.pieces.len });
+            log.info("Wrote piece {}/{}", .{ self.to_write_piece, self.torrent.info.pieces.len - 1 });
             self.to_write_piece += 1;
+            self.inflight_file_pieces += 1;
         }
     }
 };
 
 export fn on_file_write(req: ?*c.uv_write_t, status: i32) void {
     const write_req = @fieldParentPtr(WriteReq, "req", req.?);
-    const tc = getTorrentContext(req);
+    const tc = getTorrentContext(req.?.handle);
     tc.allocator.free(write_req.buf.base[0..write_req.buf.len]);
     tc.allocator.destroy(write_req);
+    tc.inflight_file_pieces -= 1;
 }
 
 export fn on_torrent_timer(timer: ?*c.uv_timer_t) void {
@@ -488,16 +491,10 @@ const PeerConnection = struct {
             return;
         }
 
-        var req = self.torrent.allocator.create(WriteReq) catch unreachable;
-        const c_keep_alive = @intToPtr([*c]u8, @ptrToInt(msg.KEEP_ALIVE[0..]));
-        req.buf = c.uv_buf_init(c_keep_alive, @intCast(u32, msg.KEEP_ALIVE.len));
-        _ = c.uv_write(
-            &req.req,
-            @ptrCast(?*c.uv_stream_t, &self.connection),
-            &req.buf,
-            1,
-            on_write_keep_alive,
-        );
+        const c_keep_alive = @intToPtr([*c]u8, @ptrToInt(msg.KEEP_ALIVE[0..]))[0..msg.KEEP_ALIVE.len];
+        msg.write(self.torrent.allocator, c_keep_alive, &self.connection, on_write_keep_alive) catch |e| {
+            log.warn("Could not write keep-alive to peer {}", .{self.peer});
+        };
     }
 
     pub fn onConnect(self: *@This(), connection: ?*c.uv_connect_t, status: i32) void {
@@ -512,12 +509,28 @@ const PeerConnection = struct {
             return;
         }
         log.info("Successfully connected to peer: {}", .{self.peer});
-        var req = alloc.create(WriteReq) catch unreachable;
-        var to_send = msg.make_handshake(alloc, self.torrent.peer_id, self.torrent.torrent.info_hash) catch unreachable;
-        req.buf = c.uv_buf_init(to_send.ptr, @intCast(u32, to_send.len));
-        log.debug("Sent peer - {}", .{to_send});
-        _ = c.uv_write(&req.req, connection.?.handle, &req.buf, 1, on_write);
-        _ = c.uv_read_start(connection.?.handle, alloc_buffer, on_read_handshake);
+
+        var handshake = msg.make_handshake(
+            alloc,
+            self.torrent.peer_id,
+            self.torrent.torrent.info_hash,
+        ) catch |e| {
+            log.warn("Error allocating handshake for peer {}", .{self.peer});
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.connection), on_close);
+            return;
+        };
+
+        msg.write(alloc, handshake, &self.connection, on_write) catch |e| {
+            log.warn("Error sending handshake to peer {}", .{self.peer});
+            alloc.free(handshake);
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.connection), on_close);
+            return;
+        };
+
+        msg.read_start(&self.connection, alloc_buffer, on_read_handshake) catch |e| {
+            log.warn("Error reading from stream for peer {}: {}", .{ self.peer, e });
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.connection), on_close);
+        };
     }
 
     pub fn allocBuffer(self: *@This(), handle: ?*c.uv_handle_t, suggested_size: usize, buf: ?*c.uv_buf_t) void {
@@ -552,6 +565,8 @@ const PeerConnection = struct {
         }
 
         self.current_work = null;
+        self.choked = true;
+        self.interested = false;
     }
 
     pub fn onHandshake(self: *@This(), client: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) void {
@@ -576,12 +591,24 @@ const PeerConnection = struct {
             };
             self.stream_buffer.discard(msg.HANDSHAKE_LENGTH);
 
-            self.sendUnchoke();
-            self.sendInterested();
+            self.sendUnchoke() catch |e| {
+                log.warn("Error sending unchoke to peer {}", .{self.peer});
+                _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), on_close);
+                return;
+            };
+            self.sendInterested() catch |e| {
+                log.warn("Error sending interested to peer {}", .{self.peer});
+                _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), on_close);
+                return;
+            };
 
             self.handleMessages();
 
-            _ = c.uv_read_start(client, alloc_buffer, on_read);
+            msg.read_start(client, alloc_buffer, on_read) catch |e| {
+                log.warn("Error swapping read stream from handshake for peer {}: {}", .{ self.peer, e });
+                _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), on_close);
+                return;
+            };
 
             // setup keepalive timer
             _ = c.uv_timer_init(self.torrent.loop, &self.timer);
@@ -595,6 +622,11 @@ const PeerConnection = struct {
             if (nread == c.UV_EOF) {
                 log.warn("Peer {} disconnected. Closing handle...", .{self.peer});
                 _ = c.uv_close(@ptrCast(?*c.uv_handle_t, client), on_close);
+                if (self.current_work) |cw| {
+                    if (!piece_complete(cw, self.torrent.torrent.info.piece_length)) {
+                        self.return_piece();
+                    }
+                }
             }
         } else if (nread > 0) {
             self.stream_buffer.update(@intCast(usize, nread));
@@ -604,52 +636,40 @@ const PeerConnection = struct {
         self.handleMessages();
     }
 
-    fn sendUnchoke(self: *@This()) void {
-        var req = self.torrent.allocator.create(WriteReq) catch unreachable;
-        var to_send = msg.make_unchoke(self.torrent.allocator) catch unreachable;
-        req.buf = c.uv_buf_init(to_send.ptr, @intCast(u32, to_send.len));
-        log.debug("Sent peer - {x}", .{to_send});
-        _ = c.uv_write(&req.req, @ptrCast(?*c.uv_stream_t, &self.connection), &req.buf, 1, on_write);
+    fn sendUnchoke(self: *@This()) !void {
+        var unchoke = msg.make_unchoke(self.torrent.allocator) catch unreachable;
+        errdefer self.torrent.allocator.free(unchoke);
+        try msg.write(self.torrent.allocator, unchoke, &self.connection, on_write);
     }
 
-    fn sendInterested(self: *@This()) void {
-        var req = self.torrent.allocator.create(WriteReq) catch unreachable;
-        var to_send = msg.make_interested(self.torrent.allocator) catch unreachable;
-        req.buf = c.uv_buf_init(to_send.ptr, @intCast(u32, to_send.len));
-        log.debug("Sent peer - {x}", .{to_send});
-        _ = c.uv_write(&req.req, @ptrCast(?*c.uv_stream_t, &self.connection), &req.buf, 1, on_write);
+    fn sendInterested(self: *@This()) !void {
+        var interested = msg.make_interested(self.torrent.allocator) catch unreachable;
+        errdefer self.torrent.allocator.free(interested);
+        try msg.write(self.torrent.allocator, interested, &self.connection, on_write);
     }
 
     fn handleMessages(self: *@This()) void {
         var data = self.stream_buffer.readableSlice(0);
         log.debug("Total stream to process {} bytes", .{data.len});
-        log.debug("Data: {x}", .{data});
+        //log.debug("Data: {x}", .{data});
 
         var consumed_bytes: usize = 0;
         const total_bytes = data.len;
 
         defer self.stream_buffer.discard(consumed_bytes);
 
-        while (msg.consume_message(data)) |message| {
-            consumed_bytes += 4; // msg len TODO make this better
-            defer data = data[4 + message.len ..];
-            // TODO actually track keep-alive from their point of view
-            // and close unresponsive connections
-            if (message.len == 0) {
-                continue;
-            }
+        while (msg.consume_message(data) catch |e| {
+            log.warn("Error - invalid message received from peer {}", .{self.peer});
+            _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.connection), on_close);
+            return;
+        }) |message| {
+            consumed_bytes += message.total_size;
+            data = data[message.total_size..];
 
-            log.debug("Processing msg - {x}", .{message});
+            log.debug("Processing msg - {}", .{message.message_type});
 
-            consumed_bytes += message.len;
-
-            const msg_type = msg.message_type(message[0]);
-            if (msg_type == null) {
-                log.err("Invalid message type recieved - {}", .{message[0]});
-                return;
-            }
-
-            switch (msg_type.?) {
+            switch (message.message_type) {
+                .keep_alive => {},
                 .choke => {
                     self.choked = true;
                 },
@@ -659,14 +679,13 @@ const PeerConnection = struct {
                 .interested => {},
                 .not_interested => {},
                 .have => {
-                    const idx = std.mem.bigToNative(u32, std.mem.bytesToValue(u32, message[1..5]));
+                    const idx = message.number(u32, 0);
                     self.setIdx(idx);
                 },
                 .bitfield => { // basically a big "have" message
-                    std.debug.assert(message[1..].len <= self.bitfield.items.len);
+                    std.debug.assert(message.data.len <= self.bitfield.items.len);
 
-                    var bitfield = message[1..];
-                    for (bitfield) |byte, i| {
+                    for (message.data) |byte, i| {
                         self.bitfield.items[i] = byte;
                     }
                 },
@@ -675,11 +694,17 @@ const PeerConnection = struct {
                 .cancel => { // we're not uploading so whatever
                 },
                 .piece => { // Actually save the file
-                    const idx = std.mem.bigToNative(u32, std.mem.bytesToValue(u32, message[1..5]));
-                    var rest = message[5..];
-                    const offset = std.mem.bigToNative(u32, std.mem.bytesToValue(u32, rest[0..4]));
-                    rest = rest[4..];
+                    const idx = message.number(u32, 0);
+                    const offset = message.number(u32, @sizeOf(u32));
+                    var rest = message.data[@sizeOf(u32) + @sizeOf(u32) ..];
                     if (self.current_work) |*cw| {
+                        if (cw.idx != idx) {
+                            log.warn(
+                                "Got a piece message for wrong piece - got {{idx = {}, offset = {}}} expected {}",
+                                .{ idx, offset, cw.idx },
+                            );
+                            continue;
+                        }
                         if (rest.len != piece_size) {
                             log.warn(
                                 "Got a piece message with incorrect piece size - {b} vs {b}",
@@ -690,7 +715,7 @@ const PeerConnection = struct {
                         std.mem.copy(u8, write_to, rest);
                         self.piece_buffer.update(rest.len);
 
-                        log.debug("Peer {} Wrote Piece {{idx = {}, offset = {}}}", .{ self.peer, idx, offset });
+                        log.info("Peer {} Wrote Piece {{idx = {}, offset = {}}}", .{ self.peer, idx, offset });
 
                         cw.awaiting -= 1;
                         cw.current_offset += rest.len;
@@ -728,6 +753,14 @@ const PeerConnection = struct {
         self.piece_buffer = Buffer.init(self.torrent.allocator);
     }
 
+    fn return_piece(self: *@This()) void {
+        if (self.current_work) |cw| {
+            self.torrent.work_queue.writeItem(cw.idx) catch unreachable;
+        }
+        self.current_work = null;
+        self.piece_buffer.discard(self.piece_buffer.readableLength());
+    }
+
     fn nextPiece(self: *@This()) void {
         if (self.choked) {
             return;
@@ -742,12 +775,21 @@ const PeerConnection = struct {
             }
 
             while (cw.awaiting < max_pipelined_pieces and cw.current_offset < self.torrent.torrent.info.piece_length) {
-                var req = self.torrent.allocator.create(WriteReq) catch unreachable;
-                var to_send = msg.make_request(self.torrent.allocator, cw.idx, cw.current_offset, piece_size) catch unreachable;
-                req.buf = c.uv_buf_init(to_send.ptr, @intCast(u32, to_send.len));
+                const amnt = std.math.min(piece_size, self.torrent.torrent.info.piece_length - cw.current_offset);
+                var request = msg.make_request(self.torrent.allocator, cw.idx, cw.current_offset, amnt) catch unreachable;
                 log.debug("Requesting next offset ({})", .{cw.current_offset});
-                log.debug("Sent peer - {x}", .{to_send});
-                _ = c.uv_write(&req.req, @ptrCast(?*c.uv_stream_t, &self.connection), &req.buf, 1, on_write);
+                msg.write(self.torrent.allocator, request, &self.connection, on_write) catch |e| {
+                    log.warn(
+                        "Error requesting {{idx = {}, offset = {}}} from peer {}. Returning piece to queue - {}",
+                        .{ cw.idx, cw.current_offset, self.peer, e },
+                    );
+                    self.torrent.work_queue.writeItem(cw.idx) catch unreachable;
+                    self.current_work = null;
+                    self.piece_buffer.deinit();
+                    self.piece_buffer = Buffer.init(self.torrent.allocator);
+                    return;
+                };
+
                 cw.awaiting += 1;
                 cw.current_offset += piece_size;
             }

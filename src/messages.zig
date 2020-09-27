@@ -1,5 +1,62 @@
 const std = @import("std");
+
 const c = @import("c.zig");
+const util = @import("util.zig");
+
+const log = std.log.scoped(.messages);
+
+pub const WriteCallback = fn (handle: ?*c.uv_write_t, status: i32) callconv(.C) void;
+pub const AllocCallback = fn (handle: ?*c.uv_handle_t, size: usize, buf: ?*c.uv_buf_t) callconv(.C) void;
+pub const ReadCallback = fn (handle: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) callconv(.C) void;
+
+/// Write data to a given stream
+/// Does _not_ take ownership of the data slice
+/// The data slice must be freed in the callback
+pub fn write(
+    allocator: *std.mem.Allocator,
+    data: []u8,
+    stream: anytype,
+    callback: WriteCallback,
+) !void {
+    comptime {
+        if (!util.is_pointer(@TypeOf(stream))) {
+            @compileLog(@TypeOf(stream));
+            @compileError("Stream must be a pointer type");
+        }
+    }
+
+    var req = try allocator.create(WriteReq);
+    errdefer allocator.destroy(req);
+
+    req.buf = c.uv_buf_init(data.ptr, @intCast(u32, data.len));
+    const result = c.uv_write(
+        &req.req,
+        @ptrCast(?*c.uv_stream_t, stream),
+        &req.buf,
+        1,
+        callback,
+    );
+
+    if (result < 0) {
+        return error.write_error;
+    }
+
+    //log.debug("Sent message - {x}", .{data});
+}
+
+pub fn read_start(stream: anytype, alloc_cb: AllocCallback, read_cb: ReadCallback) !void {
+    comptime {
+        if (!util.is_pointer(@TypeOf(stream))) {
+            @compileLog(@TypeOf(stream));
+            @compileError("Stream must be a pointer type");
+        }
+    }
+
+    const result = c.uv_read_start(@ptrCast(?*c.uv_stream_t, stream), alloc_cb, read_cb);
+    if (result < 0) {
+        return error.stream_read_error;
+    }
+}
 
 pub const WriteReq = struct {
     req: c.uv_write_t,
@@ -45,6 +102,7 @@ pub const MessageType = enum(u8) {
     request,
     piece,
     cancel,
+    keep_alive,
 };
 
 /// Create the handshake message for a particular torrent
@@ -91,24 +149,59 @@ pub fn consume_handshake(msg: []const u8, info_hash: []const u8) ![]const u8 {
     return msg[0..HANDSHAKE_LENGTH];
 }
 
+pub const Message = struct {
+    total_size: u32,
+    message_type: MessageType,
+    data: []const u8,
+
+    pub fn number(self: Message, comptime T: type, offset: usize) T {
+        var num = [_]u8{undefined} ** @sizeOf(T);
+        std.mem.copy(u8, num[0..], self.data[offset .. offset + @sizeOf(T)]);
+        return std.mem.bigToNative(T, std.mem.bytesToValue(T, num[0..]));
+    }
+};
+
 /// Consume a message
 /// throws away the size field if
 /// a complete message exists
-pub fn consume_message(data: []const u8) ?[]const u8 {
-    if (data.len < 4) {
+/// Errors on invalid data
+pub fn consume_message(data: []const u8) !?Message {
+    var d = data[0..];
+    if (d.len < 4) {
         return null;
     }
 
-    const size = std.mem.bigToNative(u32, std.mem.bytesToValue(u32, data[0..4]));
-    if (data[4..].len < size) {
+    const size = std.mem.bigToNative(u32, std.mem.bytesToValue(u32, d[0..4]));
+    d = d[4..];
+
+    // Keep alive message - only consume size
+    if (size == 0) {
+        return Message{
+            .total_size = 4,
+            .message_type = .keep_alive,
+            .data = d[0..size],
+        };
+    }
+
+    // we don't have enough from the stream
+    if (d.len < size) {
         return null;
     }
 
-    return data[4 .. 4 + size];
+    const msg_type = message_type(d[0]);
+    if (msg_type) |t| {
+        return Message{
+            .total_size = size + 4,
+            .message_type = t,
+            .data = d[1..size],
+        };
+    } else {
+        return error.unknown_msg_type;
+    }
 }
 
 pub fn message_type(char: u8) ?MessageType {
-    if (char > std.meta.fields(MessageType).len) {
+    if (char > std.meta.fields(MessageType).len - 1) {
         return null;
     }
 

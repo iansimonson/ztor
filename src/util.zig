@@ -63,3 +63,17 @@ pub fn slice_back(data: anytype) @TypeOf(data) {
 pub fn slice_front(data: anytype) @TypeOf(data) {
     return data[0..1];
 }
+
+fn is_(comptime T: type, comptime type_enum: @Type(.EnumLiteral)) bool {
+    return switch (@typeInfo(T)) {
+        type_enum => true,
+        .Optional => |o| {
+            return is_(o.child, type_enum);
+        },
+        else => false,
+    };
+}
+
+pub fn is_pointer(comptime T: type) bool {
+    return is_(T, .Pointer);
+}
