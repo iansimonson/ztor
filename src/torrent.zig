@@ -180,15 +180,26 @@ pub const TorrentContext = struct {
         break :blk count;
     };
 
-    pub fn progress(self: @This()) Progress {
+    fn num_pieces(self: @This()) usize {
         var count: usize = 0;
         for (self.have_bitfield.items) |item| {
             count += bitcount_lookup[item];
         }
+        return count;
+    }
+
+    pub fn progress(self: @This()) Progress {
+        const count = self.num_pieces();
         return .{
             .current = count,
             .total = self.torrent.info.pieces.len,
         };
+    }
+
+    pub fn validate_hash(self: @This(), data: []const u8, piece: usize) bool {
+        var hash_buffer = [_]u8{undefined} ** 20;
+        std.crypto.hash.Sha1.hash(data, hash_buffer[0..], .{});
+        return std.mem.eql(u8, hash_buffer[0..], self.torrent.info.pieces[piece][0..]);
     }
 
     pub fn start(self: *@This(), loop: *c.uv_loop_t) !void {
@@ -379,7 +390,7 @@ pub const TorrentContext = struct {
         const name = self.allocator.dupeZ(u8, self.torrent.info.files.items[0].name) catch unreachable;
         defer self.allocator.free(name);
         var req: c.uv_fs_t = undefined;
-        self.output_filed = c.uv_fs_open(self.loop, &req, name.ptr, c.O_CREAT | c.O_RDWR, 0o644, null);
+        self.output_filed = c.uv_fs_open(self.loop, &req, name.ptr, c.O_CREAT | c.O_TRUNC | c.O_RDWR, 0o644, null);
         _ = c.uv_pipe_init(self.loop, &self.output_file_pipe, 0);
         self.output_file_pipe.data = self;
         _ = c.uv_pipe_open(&self.output_file_pipe, self.output_filed);
@@ -410,7 +421,10 @@ pub const TorrentContext = struct {
     }
 
     pub fn checkFinished(self: *@This()) void {
-        const work_done = self.work_queue.readableLength() == 0 and self.completed_pieces.items.len == 0 and self.inflight_file_pieces == 0;
+        const num_have = self.num_pieces();
+        const have_all = num_have == self.torrent.info.pieces.len;
+
+        const work_done = have_all and self.inflight_file_pieces == 0;
 
         if (!work_done) {
             return;
@@ -423,7 +437,8 @@ pub const TorrentContext = struct {
         }
 
         for (self.connected_peers.items) |peer| {
-            peer.close();
+            peer.close(); // peer will destroy itself
+            self.inactive_peers.append(peer) catch unreachable;
         }
         _ = self.connected_peers.resize(0) catch unreachable;
 
@@ -511,6 +526,7 @@ const PeerConnection = struct {
     hand_shook: bool = false,
     connection: c.uv_tcp_t,
     timer: c.uv_timer_t,
+    download_timer: c.uv_timer_t = undefined,
     torrent: *TorrentContext,
     // this is read-stream, do we need a write stream?
     stream_buffer: Buffer,
@@ -603,6 +619,7 @@ const PeerConnection = struct {
     pub fn close(self: *@This()) void {
         log.warn("Peer is closing...", .{});
         _ = c.uv_timer_stop(&self.timer);
+        _ = c.uv_timer_stop(&self.download_timer);
         if (c.uv_is_active(@ptrCast(?*c.uv_handle_t, &self.connection)) != 0) {
             _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.connection), on_close);
         }
@@ -611,6 +628,7 @@ const PeerConnection = struct {
     pub fn onClose(self: *@This(), handle: ?*c.uv_handle_t) void {
         log.info("Successfully closed connection to peer {}", .{self.peer});
         _ = c.uv_timer_stop(&self.timer);
+        _ = c.uv_timer_stop(&self.download_timer);
         if (self.current_work) |cw| {
             self.torrent.work_queue.writeItem(cw.idx) catch unreachable;
         }
@@ -665,6 +683,10 @@ const PeerConnection = struct {
             _ = c.uv_timer_init(self.torrent.loop, &self.timer);
             self.timer.data = @ptrCast(?*c_void, self);
             _ = c.uv_timer_start(&self.timer, keep_alive, keep_alive_timeout, keep_alive_timeout);
+
+            _ = c.uv_timer_init(self.torrent.loop, &self.download_timer);
+            self.download_timer.data = @ptrCast(?*c_void, self);
+            _ = c.uv_timer_start(&self.download_timer, on_download_timer, 30 * 1000, 30 * 1000);
         }
     }
 
@@ -795,6 +817,12 @@ const PeerConnection = struct {
 
     fn send_finished_piece(self: *@This()) void {
         self.piece_buffer.realign();
+        const valid = self.torrent.validate_hash(self.piece_buffer.readableSlice(0), self.current_work.?.idx);
+        if (!valid) {
+            log.warn("Could not validate hash of piece {} from peer {}", .{ self.current_work.?.idx, self.peer });
+            self.return_piece();
+            return;
+        }
         self.torrent.completed_pieces.append(.{
             .index = self.current_work.?.idx,
             .buffer = self.piece_buffer.buf,
@@ -845,6 +873,7 @@ const PeerConnection = struct {
                 cw.awaiting += 1;
                 cw.current_offset += piece_size;
             }
+            _ = c.uv_timer_again(&self.download_timer);
         } else {
             const idx = self.torrent.work_queue.readItem();
 
@@ -875,6 +904,10 @@ const PeerConnection = struct {
         const byte_idx = @divTrunc(idx, 8);
         const bit_idx = (7 - @mod(idx, 8));
         return (self.bitfield.items[byte_idx] & (std.math.shl(u8, 1, bit_idx))) != 0;
+    }
+
+    pub fn downloadTimerElapsed(self: *@This()) void {
+        self.return_piece();
     }
 };
 
@@ -1047,6 +1080,13 @@ pub const Peer = struct {
         });
     }
 };
+
+export fn on_download_timer(handle: ?*c.uv_timer_t) void {
+    std.debug.assert(handle != null);
+
+    const peer_con = get_peer_connection(handle);
+    peer_con.downloadTimerElapsed();
+}
 
 export fn keep_alive(handle: ?*c.uv_timer_t) void {
     std.debug.assert(handle != null);
