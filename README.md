@@ -3,10 +3,10 @@ ZTOR
 Zig BitTorrent Client
 ---
 
-A small but slightly more than non-trivial program for actually using zig
+A small but slightly more than non-trivial program written in Zig.
 
-Specificially this was using zig with a c event-loop library and callback-based appraoch. Some of the nice bits you get out of zig
-such as errors can't be used everywhere.
+This was mostly an experiment in using zig with a c event-loop library and callback-based appraoch. A number of
+useful zig features, such as errors, can't be used due to the C abi boundary being pervasive.
 
 I do not recommend using this code as a good example as there are no tests and currently I've thrown a lot of it together in one place. But if it helps then go for it.
 
