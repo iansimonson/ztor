@@ -54,7 +54,7 @@ zig build
 - [ ] Setup imgui (or similar) for handling torrents in GUI mode
 
 ### Additional TODO:
-- [ ] Build libuv in build.zig
+- [x] Build libuv in build.zig
 - [ ] Move from libuv to native zig async/await
     - [ ] Abstract away libuv
 - [ ] Support non-compact peer list
