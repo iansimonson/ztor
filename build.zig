@@ -91,12 +91,22 @@ fn build_libuv(b: *Builder) *std.build.RunStep {
     const build_libuv_step = b.addSystemCommand(
         &[_][]const u8{
             "cmake",
+            "--build",
+            "./deps/libuv/build",
+        },
+    );
+
+    build_libuv_step.step.dependOn(&run_cmake.step);
+
+    const install_libuv_step = b.addSystemCommand(
+        &[_][]const u8{
+            "cmake",
             "--install",
             "./deps/libuv/build",
         },
     );
-    build_libuv_step.step.dependOn(&run_cmake.step);
-    return build_libuv_step;
+    install_libuv_step.step.dependOn(&build_libuv_step.step);
+    return install_libuv_step;
 }
 
 pub fn build(b: *Builder) !void {
