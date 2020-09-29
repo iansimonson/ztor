@@ -3,9 +3,24 @@ ZTOR
 Zig BitTorrent Client
 ---
 
-**NOT CURRENTLY FUNCTIONAL. Work in progress**
+A small but slightly more than non-trivial program for actually using zig
 
-A small-ish but non-trivial program for seeing where zig breaks down / shines.
+Specificially this was using zig with a c event-loop library and callback-based appraoch. Some of the nice bits you get out of zig
+such as errors can't be used everywhere.
+
+I do not recommend using this code as a good example as there are no tests and currently I've thrown a lot of it together in one place. But if it helps then go for it.
+
+### Build
+
+This program depends on a number of modules and builds both http\_parser and libuv.
+
+```
+git clone --recursive https://github.com/iansimonson/ztor.git
+cd ztor
+zig build
+```
+
+
 
 
 ### Plan
@@ -17,16 +32,25 @@ A small-ish but non-trivial program for seeing where zig breaks down / shines.
     - [x] Construct peer connection info per peer
     - [x] Only download on unchoke
 - [ ] Use `uv_get_handle` rather than the members
+- [ ] Support for N .torrent files at once
+    - [ ] Don't shutdown after a file is done downloading
+- [ ] Implement upload and answering requests
+    - [ ] Send `have` messages to all peers on download
+    - [ ] If `have` send piece on request
+    - [ ] provide mechanism to get non-owning immutable slice to piece
 - [ ] Setup server for incoming connections
     - [ ] Upload throttled amount of data
+    - [ ] Send bitfield on new incoming connections
+- [ ] Add invalid threshold
+    - [ ] After x amount of invalid pieces close connection to peer
 - [ ] Throttle data speeds
     - [ ] [Token Bucket](https://en.wikipedia.org/wiki/Token\_bucket)?
     - [ ] Upload throttle
     - [ ] Download throttle
-- [ ] Setup imgui for handling torrents in GUI mode
-- [ ] Support for N .torrent files at once
+- [ ] Setup imgui (or similar) for handling torrents in GUI mode
 
 ### Additional TODO:
+- [ ] Build libuv in build.zig
 - [ ] Move from libuv to native zig async/await
     - [ ] Abstract away libuv
 - [ ] Support non-compact peer list
