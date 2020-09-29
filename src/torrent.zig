@@ -808,7 +808,9 @@ const PeerConnection = struct {
 
                         if (piece_complete(cw.*, self.torrent.torrent.info.piece_length)) {
                             log.debug("Peer {} fully downloaded piece {}", .{ self.peer, cw.idx });
-                            self.send_finished_piece();
+                            self.send_finished_piece() catch {
+                                continue;
+                            };
                         }
                         self.nextPiece();
                     } else {
@@ -828,13 +830,13 @@ const PeerConnection = struct {
         return work.awaiting == 0 and work.current_offset >= length;
     }
 
-    fn send_finished_piece(self: *@This()) void {
+    fn send_finished_piece(self: *@This()) !void {
         self.piece_buffer.realign();
         const valid = self.torrent.validate_hash(self.piece_buffer.readableSlice(0), self.current_work.?.idx);
         if (!valid) {
             log.debug("Could not validate hash of piece {} from peer {}", .{ self.current_work.?.idx, self.peer });
             self.return_piece();
-            return;
+            return error.invalid_piece;
         }
         self.torrent.completed_pieces.append(.{
             .index = self.current_work.?.idx,
