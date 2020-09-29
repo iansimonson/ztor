@@ -5,9 +5,16 @@ const util = @import("util.zig");
 
 const log = std.log.scoped(.messages);
 
-pub const WriteCallback = fn (handle: ?*c.uv_write_t, status: i32) callconv(.C) void;
+pub const WriteCallback = fn (handle: ?*c.uv_write_t, status: i32, buffer: ?*c.uv_buf_t) callconv(.C) void;
 pub const AllocCallback = fn (handle: ?*c.uv_handle_t, size: usize, buf: ?*c.uv_buf_t) callconv(.C) void;
 pub const ReadCallback = fn (handle: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) callconv(.C) void;
+
+const WriteReq = struct {
+    req: c.uv_write_t,
+    buf: c.uv_buf_t,
+    alloc: *std.mem.Allocator,
+    callback: ?WriteCallback,
+};
 
 /// Write data to a given stream
 /// Does _not_ take ownership of the data slice
@@ -16,7 +23,7 @@ pub fn write(
     allocator: *std.mem.Allocator,
     data: []u8,
     stream: anytype,
-    callback: WriteCallback,
+    callback: ?WriteCallback,
 ) !void {
     comptime {
         if (!util.is_pointer(@TypeOf(stream))) {
@@ -29,19 +36,29 @@ pub fn write(
     errdefer allocator.destroy(req);
 
     req.buf = c.uv_buf_init(data.ptr, @intCast(u32, data.len));
+    req.alloc = allocator;
+    req.callback = callback;
     const result = c.uv_write(
         &req.req,
         @ptrCast(?*c.uv_stream_t, stream),
         &req.buf,
         1,
-        callback,
+        write_finish,
     );
 
     if (result < 0) {
         return error.write_error;
     }
+}
 
-    //log.debug("Sent message - {x}", .{data});
+/// A wrapper function to free the `WriteReq` and make it unnecessary
+/// to leak that data structure
+export fn write_finish(req: ?*c.uv_write_t, status: i32) void {
+    const write_req = @fieldParentPtr(WriteReq, "req", req.?);
+    if (write_req.callback) |callback| {
+        callback(req, status, &write_req.buf);
+    }
+    write_req.alloc.destroy(write_req);
 }
 
 pub fn read_start(stream: anytype, alloc_cb: AllocCallback, read_cb: ReadCallback) !void {
@@ -57,11 +74,6 @@ pub fn read_start(stream: anytype, alloc_cb: AllocCallback, read_cb: ReadCallbac
         return error.stream_read_error;
     }
 }
-
-pub const WriteReq = struct {
-    req: c.uv_write_t,
-    buf: c.uv_buf_t,
-};
 
 pub const COMPACT_PEER_LEN: usize = 6;
 

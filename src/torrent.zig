@@ -27,11 +27,11 @@ export fn onConnectTrackerFwd(connection: ?*c.uv_connect_t, status: i32) void {
     tc.onConnectTracker();
 }
 
-export fn onWriteAnnounceFwd(req: ?*c.uv_write_t, status: i32) void {
-    const write_req = @fieldParentPtr(WriteReq, "req", req.?);
+export fn onWriteAnnounceFwd(req: ?*c.uv_write_t, status: i32, buf: ?*c.uv_buf_t) void {
+    std.debug.assert(buf != null);
+
     const tc = getTorrentContext(req.?.handle);
-    tc.allocator.free(write_req.buf.base[0..write_req.buf.len]);
-    tc.allocator.destroy(write_req);
+    tc.allocator.free(buf.?.base[0..buf.?.len]);
 }
 
 export fn onReadAnnounceFwd(handle: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t) void {
@@ -117,6 +117,7 @@ pub const TorrentContext = struct {
     output_file_pipe: c.uv_pipe_t,
     output_filed: c.uv_file,
     work_queue: WorkQueue,
+    have_bitfield: PeerConnection.Bitfield,
 
     tracker_connection: c.uv_tcp_t,
     timer: c.uv_timer_t,
@@ -135,6 +136,7 @@ pub const TorrentContext = struct {
             .output_file_pipe = undefined,
             .output_filed = undefined,
             .work_queue = WorkQueue.init(alloc),
+            .have_bitfield = PeerConnection.Bitfield.init(alloc),
             .tracker_connection = undefined,
             .timer = undefined,
             .tracker_read_stream = std.fifo.LinearFifo(u8, .Dynamic).init(alloc),
@@ -153,13 +155,47 @@ pub const TorrentContext = struct {
             .output_file_pipe = undefined,
             .output_filed = undefined,
             .work_queue = WorkQueue.init(allocator),
+            .have_bitfield = PeerConnection.Bitfield.init(allocator),
             .tracker_connection = undefined,
             .timer = undefined,
             .tracker_read_stream = std.fifo.LinearFifo(u8, .Dynamic).init(allocator),
         };
     }
 
+    const Progress = struct {
+        current: usize,
+        total: usize,
+    };
+
+    const bitcount_lookup = comptime blk: {
+        var count: [256]u8 = std.mem.zeroes([256]u8);
+        var i: u8 = 1;
+        inline while (true) : (i +%= 1) {
+            count[i] = count[@divTrunc(i, 2)] + (i & 1);
+            if (i == 0) {
+                break;
+            }
+        }
+
+        break :blk count;
+    };
+
+    pub fn progress(self: @This()) Progress {
+        var count: usize = 0;
+        for (self.have_bitfield.items) |item| {
+            count += bitcount_lookup[item];
+        }
+        return .{
+            .current = count,
+            .total = self.torrent.info.pieces.len,
+        };
+    }
+
     pub fn start(self: *@This(), loop: *c.uv_loop_t) !void {
+        const total_pieces = self.torrent.info.pieces.len;
+        const bytes_required = @divTrunc(total_pieces, 8) + 1;
+        try self.have_bitfield.appendNTimes(0, bytes_required);
+
         self.loop = loop;
         _ = c.uv_tcp_init(loop, &self.tracker_connection);
         _ = c.uv_tcp_nodelay(&self.tracker_connection, 1);
@@ -289,6 +325,7 @@ pub const TorrentContext = struct {
         self.completed_pieces.deinit();
         self.tracker_read_stream.deinit();
         self.work_queue.deinit();
+        self.have_bitfield.deinit();
     }
 
     /// Adds a peer if it has not already been added
@@ -388,8 +425,9 @@ pub const TorrentContext = struct {
         for (self.connected_peers.items) |peer| {
             peer.close();
         }
+        _ = self.connected_peers.resize(0) catch unreachable;
 
-        if (self.to_write_piece > self.torrent.info.pieces.len) {
+        if (self.to_write_piece >= self.torrent.info.pieces.len) {
             _ = c.uv_timer_stop(&self.timer);
             _ = c.uv_close(@ptrCast(?*c.uv_handle_t, &self.output_file_pipe), null);
         }
@@ -408,8 +446,21 @@ pub const TorrentContext = struct {
     pub fn writePieces(self: *@This()) void {
         std.sort.sort(CompletePiece, self.completed_pieces.items, self, sort_by_index);
 
-        while (self.completed_pieces.items.len > 0 and self.completed_pieces.items[0].index == self.to_write_piece) {
+        for (self.completed_pieces.items) |item| {
+            const idx = item.index;
+            const byte_idx = @divTrunc(idx, 8);
+            const bit_idx = (7 - @mod(idx, 8));
+            self.have_bitfield.items[byte_idx] |= (std.math.shl(u8, 1, bit_idx));
+        }
+
+        while (self.completed_pieces.items.len > 0 and self.completed_pieces.items[0].index <= self.to_write_piece) {
             const item = &self.completed_pieces.items[0];
+            if (item.index < self.to_write_piece) {
+                _ = self.completed_pieces.orderedRemove(0);
+                continue;
+            }
+
+            log.info("Writing piece {{index = {}, size = {Bi}}}", .{ item.index, item.read_length });
             const data = self.allocator.alloc(u8, item.read_length) catch unreachable;
             std.mem.copy(u8, data[0..], item.buffer[0..item.read_length]);
             msg.write(self.allocator, data, &self.output_file_pipe, on_file_write) catch |e| {
@@ -427,11 +478,9 @@ pub const TorrentContext = struct {
     }
 };
 
-export fn on_file_write(req: ?*c.uv_write_t, status: i32) void {
-    const write_req = @fieldParentPtr(WriteReq, "req", req.?);
+export fn on_file_write(req: ?*c.uv_write_t, status: i32, buf: ?*c.uv_buf_t) void {
     const tc = getTorrentContext(req.?.handle);
-    tc.allocator.free(write_req.buf.base[0..write_req.buf.len]);
-    tc.allocator.destroy(write_req);
+    tc.allocator.free(buf.?.base[0..buf.?.len]);
     tc.inflight_file_pieces -= 1;
 }
 
@@ -440,6 +489,10 @@ export fn on_torrent_timer(timer: ?*c.uv_timer_t) void {
     torrent.writePieces();
     torrent.dispatchWork();
     torrent.checkFinished();
+
+    const progress = torrent.progress();
+    const stdout = std.io.getStdOut();
+    stdout.writer().print("\rDownloaded {}/{} pieces", .{ progress.current, progress.total }) catch unreachable;
 }
 
 fn get_peer_connection(handle: anytype) *PeerConnection {
@@ -492,7 +545,7 @@ const PeerConnection = struct {
         }
 
         const c_keep_alive = @intToPtr([*c]u8, @ptrToInt(msg.KEEP_ALIVE[0..]))[0..msg.KEEP_ALIVE.len];
-        msg.write(self.torrent.allocator, c_keep_alive, &self.connection, on_write_keep_alive) catch |e| {
+        msg.write(self.torrent.allocator, c_keep_alive, &self.connection, null) catch |e| {
             log.warn("Could not write keep-alive to peer {}", .{self.peer});
         };
     }
@@ -543,10 +596,8 @@ const PeerConnection = struct {
         buf.?.* = c.uv_buf_init(data.ptr, @intCast(u32, suggested_size));
     }
 
-    pub fn onWrite(self: *@This(), handle: ?*c.uv_write_t, status: i32) void {
-        const write_req = @fieldParentPtr(WriteReq, "req", handle.?);
-        self.torrent.allocator.free(write_req.buf.base[0..write_req.buf.len]);
-        self.torrent.allocator.destroy(write_req);
+    pub fn onWrite(self: *@This(), handle: ?*c.uv_write_t, status: i32, buf: ?*c.uv_buf_t) void {
+        self.torrent.allocator.free(buf.?.base[0..buf.?.len]);
     }
 
     pub fn close(self: *@This()) void {
@@ -672,6 +723,7 @@ const PeerConnection = struct {
                 .keep_alive => {},
                 .choke => {
                     self.choked = true;
+                    self.return_piece();
                 },
                 .unchoke => {
                     self.choked = false;
@@ -718,7 +770,6 @@ const PeerConnection = struct {
                         log.info("Peer {} Wrote Piece {{idx = {}, offset = {}}}", .{ self.peer, idx, offset });
 
                         cw.awaiting -= 1;
-                        cw.current_offset += rest.len;
 
                         if (piece_complete(cw.*, self.torrent.torrent.info.piece_length)) {
                             log.info("Peer {} fully downloaded piece {}", .{ self.peer, cw.idx });
@@ -755,6 +806,7 @@ const PeerConnection = struct {
 
     fn return_piece(self: *@This()) void {
         if (self.current_work) |cw| {
+            log.debug("Peer {} returning piece {}", .{ self.peer, cw.idx });
             self.torrent.work_queue.writeItem(cw.idx) catch unreachable;
         }
         self.current_work = null;
@@ -816,7 +868,7 @@ const PeerConnection = struct {
     fn setIdx(self: *@This(), idx: usize) void {
         const byte_idx = @divTrunc(idx, 8);
         const bit_idx = (7 - @mod(idx, 8));
-        self.bitfield.items[byte_idx] &= (std.math.shl(u8, 1, bit_idx));
+        self.bitfield.items[byte_idx] |= (std.math.shl(u8, 1, bit_idx));
     }
 
     fn hasPiece(self: @This(), idx: usize) bool {
@@ -1020,23 +1072,13 @@ export fn alloc_buffer(handle: ?*c.uv_handle_t, suggested_size: usize, buf: ?*c.
     peer_con.allocBuffer(handle, suggested_size, buf);
 }
 
-// special
-export fn on_write_keep_alive(req: ?*c.uv_write_t, status: i32) void {
-    std.debug.assert(req != null);
-
-    const peer_con = get_peer_connection(req.?.handle);
-
-    const write_req = @fieldParentPtr(WriteReq, "req", req.?);
-    peer_con.torrent.allocator.destroy(write_req);
-}
-
 ///// This is a callback after successfully sending bytes down
 ///// the wire
-export fn on_write(req: ?*c.uv_write_t, status: i32) void {
+export fn on_write(req: ?*c.uv_write_t, status: i32, buf: ?*c.uv_buf_t) void {
     std.debug.assert(req != null);
 
     const peer_con = get_peer_connection(req.?.handle);
-    peer_con.onWrite(req, status);
+    peer_con.onWrite(req, status, buf);
 }
 
 export fn on_close(client: ?*c.uv_handle_t) void {
@@ -1062,8 +1104,3 @@ export fn on_read(client: ?*c.uv_stream_t, nread: isize, buf: ?*const c.uv_buf_t
     const peer_con = get_peer_connection(client);
     peer_con.onRead(client, nread, buf);
 }
-
-const WriteReq = struct {
-    req: c.uv_write_t,
-    buf: c.uv_buf_t,
-};
