@@ -10,6 +10,10 @@ such as errors can't be used everywhere.
 
 I do not recommend using this code as a good example as there are no tests and currently I've thrown a lot of it together in one place. But if it helps then go for it.
 
+The torrent file is for the [debian net install image](https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/) which was used because 
+    A. debian has seeders so we probably don't have to worry about being choked all the time, and
+    B. it's a single file torrent so no need to deal with directories and multiple files.
+
 ### Build
 
 This program depends on a number of modules and builds both http\_parser and libuv.
